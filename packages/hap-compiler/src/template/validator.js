@@ -1477,25 +1477,31 @@ function checkClass(className, output) {
     }
     segs.push(className.slice(start)) // trailing static classes
 
-    const isLite = output.isLite
     classList = segs.reduce((list, seg) => {
       if (exp.isExpr(seg)) {
         hasBinding = true
-        list.push(exp(seg, false, isLite))
+        list.push(exp(seg, false))
         return list
       }
       return list.concat(
         seg
           .split(/\s+/g)
           .filter((s) => s)
-          .map((s) => (isLite ? s : `'${s}'`))
+          .map((s) => `'${s}'`)
       )
     }, [])
     classList = classList.filter((klass) => klass.trim())
 
+    const isLite = output.isLite
     if (isLite) {
-      output.result.classList = classList
-    } else if (hasBinding) {
+      if (!isValidClassArray(classList)) {
+        throw new Error('轻卡 class 样式不支持动态数据绑定 {{}} 和静态样式混用')
+      }
+      output.result.class = className
+      return
+    }
+
+    if (hasBinding) {
       const code = '(function () {return [' + classList.join(', ') + ']})'
       try {
         /* eslint-disable no-eval */
@@ -1979,6 +1985,19 @@ function hasIfOrFor(nodes) {
   return flag
 }
 
+function isValidClassArray(arr) {
+  let hasTemplateString = false
+
+  for (let i = 0; i < arr.length; i++) {
+    if (exp.isExpr(arr[i])) {
+      hasTemplateString = true
+      break
+    }
+  }
+
+  return !hasTemplateString || arr.length === 1 // 如果全都为常量 className 或者只有一个变量的className，则返回true
+}
+
 export default {
   checkTagName,
   checkId,
@@ -2001,5 +2020,6 @@ export default {
   isSupportedSelfClosing,
   isEmptyElement,
   isNotTextContentAtomic,
-  isExpr: exp.isExpr
+  isExpr: exp.isExpr,
+  parseText: exp.parseText
 }

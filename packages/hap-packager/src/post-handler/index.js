@@ -7,6 +7,7 @@ const TYPE_IMPORT = 'import'
 // 需要进行后处理的模块key
 const TEMPLATE_KEY = 'template'
 const ACTIONS_KEY = 'actions'
+const SIMPLE_EXPR_MODIFIERS = ['$', '.', '[]']
 
 // 节点标记，标记优先级依次提升
 const ENUM_KIND_TYPE = {
@@ -25,28 +26,55 @@ function postHandleActions(actions) {
 }
 
 function markType(actions) {
-  // 如果有表达式，则用前缀方式优化
   if (isExpr(actions.type)) {
-    const prefixExpr = getPrefixExpr(actions.type)
+    let { rawExpr, prefixExpr } = getPrefixExpr(actions.type)
     delete actions.type
-    actions['$type'] = prefixExpr
+    actions['$type'] = rawExpr
+    actions['#type'] = prefixExpr
   }
 }
 
 function markUrl(actions) {
-  // 如果有表达式，则用前缀方式优化
-  if (isExpr(actions.url)) {
-    const prefixExpr = getPrefixExpr(actions.url)
-    delete actions.url
-    actions['$url'] = prefixExpr
+  if (typeof actions.url === 'string') {
+    if (isExpr(actions.url)) {
+      let { rawExpr, prefixExpr } = getPrefixExpr(actions.url)
+      delete actions.url
+      actions['$url'] = rawExpr
+      actions['#url'] = prefixExpr
+    }
+  } else if (Array.isArray(actions.url)) {
+    let hasBinding = false
+    const rawUrlList = actions.url.map((url) => {
+      if (isExpr(url)) {
+        hasBinding = true
+        let { rawExpr } = getPrefixExpr(url)
+        return `{{${rawExpr}}}`
+      }
+      return url
+    })
+
+    const prefixUrlList = actions.url.map((url) => {
+      if (isExpr(url)) {
+        hasBinding = true
+        let { prefixExpr } = getPrefixExpr(url)
+        return prefixExpr
+      }
+      return url
+    })
+
+    if (hasBinding) {
+      delete actions.url
+      actions['$url'] = rawUrlList
+      actions['#url'] = prefixUrlList
+    }
   }
 }
 function markMethod(actions) {
-  // 如果有表达式，则用前缀方式优化
   if (isExpr(actions.method)) {
-    const prefixExpr = getPrefixExpr(actions.method)
+    let { rawExpr, prefixExpr } = getPrefixExpr(actions.method)
     delete actions.method
-    actions['$method'] = prefixExpr
+    actions['$method'] = rawExpr
+    actions['#method'] = prefixExpr
   }
 }
 
@@ -57,9 +85,10 @@ function markParams(actions) {
   Object.keys(actions.params).forEach((key) => {
     const value = actions.params[key]
     if (isExpr(value)) {
-      const prefixExpr = getPrefixExpr(value)
+      let { rawExpr, prefixExpr } = getPrefixExpr(value)
       delete actions.params[key]
-      actions.params['$' + key] = prefixExpr
+      actions.params['$' + key] = rawExpr
+      actions.params['#' + key] = prefixExpr
     }
   })
 }
@@ -68,7 +97,7 @@ function postHandleTemplate(template, liteCardRes) {
   if (!isObject(template)) return
 
   markStyle(template)
-  markClassList(template)
+  markClass(template)
   markAttrs(template)
   markEvents(template)
   markId(template)
@@ -102,21 +131,21 @@ function markCustomComp(template, liteCardRes) {
 }
 
 function markIf(template) {
-  // 如果有表达式，则用前缀方式优化
   if (isExpr(template.shown)) {
-    const prefixExpr = getPrefixExpr(template.shown)
+    let { rawExpr, prefixExpr } = getPrefixExpr(template.shown)
     delete template.shown
-    template['$shown'] = prefixExpr
-    template.kind = markKind(template.kind, ENUM_KIND_TYPE.FRAGMENT)
+    template['$shown'] = rawExpr
+    template['#shown'] = prefixExpr
   }
+  template.kind = markKind(template.kind, ENUM_KIND_TYPE.FRAGMENT)
 }
 
 function markIs(template) {
-  // 如果有表达式，则用前缀方式优化
   if (isExpr(template.is)) {
-    const prefixExpr = getPrefixExpr(template.is)
+    let { rawExpr, prefixExpr } = getPrefixExpr(template.is)
     delete template.is
-    template['$is'] = prefixExpr
+    template['$is'] = rawExpr
+    template['#is'] = prefixExpr
     template.kind = markKind(template.kind, ENUM_KIND_TYPE.ELEMENT)
   }
 }
@@ -124,11 +153,11 @@ function markIs(template) {
 function markId(template) {
   if (!template.id) return
 
-  // 如果有表达式，则用前缀方式优化
   if (isExpr(template.id)) {
-    const prefixExpr = getPrefixExpr(template.id)
+    let { rawExpr, prefixExpr } = getPrefixExpr(template.id)
     delete template.id
-    template['$id'] = prefixExpr
+    template['$id'] = rawExpr
+    template['#id'] = prefixExpr
   }
   // 节点有id属性，标记为kind=1
   template.kind = markKind(template.kind, ENUM_KIND_TYPE.ELEMENT)
@@ -151,20 +180,21 @@ function markFor(template) {
         "value": "item"
       },
     */
-    const prefixExpr = getPrefixExpr(template.repeat.exp)
+    let { rawExpr, prefixExpr } = getPrefixExpr(template.repeat.exp)
     delete template.repeat.exp
-    template.repeat['$exp'] = prefixExpr
-    template.kind = markKind(template.kind, ENUM_KIND_TYPE.FRAGMENT)
+    template.repeat['$exp'] = rawExpr
+    template.repeat['#exp'] = prefixExpr
   } else if (isExpr(template.repeat)) {
     /**
       <div for="{{ItemList}}">   ->
       "$repeat": "{{ItemList}}",
     */
-    const prefixExpr = getPrefixExpr(template.repeat)
+    let { rawExpr, prefixExpr } = getPrefixExpr(template.repeat)
     delete template.repeat
-    template['$repeat'] = prefixExpr
-    template.kind = markKind(template.kind, ENUM_KIND_TYPE.FRAGMENT)
+    template['$repeat'] = rawExpr
+    template['#repeat'] = prefixExpr
   }
+  template.kind = markKind(template.kind, ENUM_KIND_TYPE.FRAGMENT)
 }
 
 function markStyle(template) {
@@ -174,41 +204,33 @@ function markStyle(template) {
   if (typeof style === 'object') {
     Object.keys(style).forEach((key) => {
       const value = style[key]
-      // 如果有表达式，则用前缀方式优化
       if (isExpr(value)) {
-        const prefixExpr = getPrefixExpr(value)
+        let { rawExpr, prefixExpr } = getPrefixExpr(value)
         delete template.style[key]
-        template.style['$' + key] = prefixExpr
+        template.style['$' + key] = rawExpr
+        template.style['#' + key] = prefixExpr
         template.kind = markKind(template.kind, ENUM_KIND_TYPE.ELEMENT)
       }
     })
   } else {
-    // 如果有表达式，则用前缀方式优化
     if (isExpr(style)) {
-      const prefixExpr = getPrefixExpr(style)
+      let { rawExpr, prefixExpr } = getPrefixExpr(style)
       delete template.style
-      template['$style'] = prefixExpr
+      template['$style'] = rawExpr
+      template['#style'] = prefixExpr
       template.kind = markKind(template.kind, ENUM_KIND_TYPE.ELEMENT)
     }
   }
 }
 
-function markClassList(template) {
-  if (!template.classList || template.classList.length === 0) return
+function markClass(template) {
+  if (!template.class || template.class.length === 0) return
 
-  let hasBinding = false
-  const cList = template.classList.map((classEle) => {
-    // 如果有表达式，则用前缀方式优化
-    if (isExpr(classEle)) {
-      hasBinding = true
-      return getPrefixExpr(classEle)
-    }
-    return classEle
-  })
-  if (hasBinding) {
-    // 如果 classList 元素有表达式
-    delete template.classList
-    template['$classList'] = cList
+  if (isExpr(template.class)) {
+    let { rawExpr, prefixExpr } = getPrefixExpr(template.class)
+    delete template.class
+    template['$class'] = rawExpr
+    template['#class'] = prefixExpr
     template.kind = markKind(template.kind, ENUM_KIND_TYPE.ELEMENT)
   }
 }
@@ -224,11 +246,11 @@ function markAttrs(template) {
   if (isObject(attrs)) {
     Object.keys(attrs).forEach((attrKey) => {
       const attrValue = attrs[attrKey]
-      // 如果有表达式，则用前缀方式优化
       if (isExpr(attrValue)) {
-        const prefixExpr = getPrefixExpr(attrValue)
+        let { rawExpr, prefixExpr } = getPrefixExpr(attrValue)
         delete attrs[attrKey]
-        attrs['$' + attrKey] = prefixExpr
+        attrs['$' + attrKey] = rawExpr
+        attrs['#' + attrKey] = prefixExpr
         template.kind = markKind(template.kind, ENUM_KIND_TYPE.ELEMENT)
       }
     })
@@ -248,16 +270,39 @@ function getPrefixExpr(expr) {
   const res = templateValueToCardCode(expr)
   const parsed = JSON.parse(res)
   if (isSimpleExpr(parsed)) {
-    // 表达式是简单标识符，直接返回模板字符串。如： {{ name }} -> {{ name }}
-    return expr
+    // 简单表达式
+    // 目前只有 {{name}}、{{title.name}}、{{title[0]}} 算作简单表达式
+    return {
+      rawExpr: validator.parseText(expr)[0].value, // {{ name }} -> name
+      prefixExpr: parsed // {{ name }} -> ['$', 'name']
+    }
   } else {
-    // 表达式为复杂表达式，返回前缀表达式字符串。如： {{ $item.name }} -> [".",["$","$item"],"name"]
-    return parsed
+    // 复杂表达式
+    return {
+      rawExpr: expr, // {{ a + b }} -> {{ a + b }}
+      prefixExpr: parsed // {{ a + b }} -> ["+",["$","a"],["$","b"]]
+    }
   }
 }
 
+// 根据操作符来判断是否为简单表达式
 function isSimpleExpr(expr) {
-  return Array.isArray(expr) && expr.length === 2 && expr[0] === '$'
+  if (!expr || !Array.isArray(expr)) return false
+
+  const modifierList = []
+  getAllModifiers(expr, modifierList)
+  return modifierList.every((modifier) => SIMPLE_EXPR_MODIFIERS.includes(modifier))
+}
+
+function getAllModifiers(exprList, modifierList) {
+  modifierList.push(exprList[0])
+  for (let i = 1; i < exprList.length; i++) {
+    if (Array.isArray(exprList[i])) {
+      // 如果当前元素是数组，递归调用，找出所有的操作符
+      getAllModifiers(exprList[i], modifierList)
+    }
+  }
+  return modifierList
 }
 
 function recordKeys(liteCardRes, templateKeys) {
