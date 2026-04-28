@@ -40,6 +40,12 @@ class ADBModule {
     this._lastPromise = null
 
     this.emulators = new Map()
+    // reverse 自愈巡检定时器：周期性校验每台设备的 adb reverse 规则是否仍然存在，缺失则补建
+    this._reverseWatchdogTimer = null
+    // 防止一次巡检尚未结束时又触发下一次巡检，避免并发堆积
+    this._reverseWatchdogRunning = false
+    // 按设备 sn 维度串行化 reverse 相关操作，避免同一台设备上 adb 命令交错导致状态不一致
+    this._reverseSerialQueue = new Map()
 
     this.init()
   }
@@ -56,6 +62,7 @@ class ADBModule {
       this._listen(event, this.onDeviceRemoved.bind(this))
     })
     this.devicesEmitter.start()
+    this.startReverseWatchdog()
   }
 
   /**
@@ -178,7 +185,7 @@ class ADBModule {
   async getForwardPort(client, remotePort) {
     let remote2local = client.remote2local
     if (!remote2local) return client.port
-    
+
     let port = remote2local[remotePort]
     if (!port) {
       // addForwardPort
@@ -189,7 +196,9 @@ class ADBModule {
 
   async addForwardPort(client, remotePort) {
     const port = this._getNextLocalForwardPort()
-    debuglog(`addForwardPort():(${client.sn}) (local port: ${port}, remote port: ${remotePort}) start`)
+    debuglog(
+      `addForwardPort():(${client.sn}) (local port: ${port}, remote port: ${remotePort}) start`
+    )
     const upForwardResult = await this.establishADBProxyLink(
       'forward',
       [client.sn].concat([port, remotePort])
@@ -202,7 +211,9 @@ class ADBModule {
     }
     client.remote2local[remotePort] = port
     await this._writeClientLogFile(client)
-    debuglog(`addForwardPort():(${client.sn}) (local port: ${port}, remote port: ${remotePort}) end`)
+    debuglog(
+      `addForwardPort():(${client.sn}) (local port: ${port}, remote port: ${remotePort}) end`
+    )
     return port
   }
 
@@ -213,21 +224,170 @@ class ADBModule {
     const { sn } = event
     try {
       setTimeout(async () => {
-        const { result } = await this.commander._commandFactory(`adb -s ${sn} reverse --list`)
-        const reverseBoolean = result && result.indexOf(this.option.localReversePort) !== -1
-        if (reverseBoolean) {
-          colorconsole.info(
-            `### App Server ### onCheckDeviceReverse(): (${sn})建立adb reverse成功 )`
-          )
-        } else {
-          colorconsole.error(
-            `### App Server ### onCheckDeviceReverse(): (${sn})建立adb reverse失败,请重新运行命令调试 )`
-          )
-        }
+        // 统一走“检查 + 修复”的逻辑：如果 reverse 已经丢失（例如设备快速拔插导致规则被清空），这里会自动补建
+        await this._ensureReverseForDevice(sn, { log: true })
       }, 6000)
     } catch (err) {
       colorconsole.error(`### App Server ### onCheckDeviceReverse(): adb reverse连接检测失败`)
     }
+  }
+
+  startReverseWatchdog() {
+    // 避免重复启动
+    if (this._reverseWatchdogTimer) return
+    // 2s 进行一次 reverse 的自检
+    const intervalMs = Number(this.option.reverseWatchdogIntervalMs || 2000)
+    this._reverseWatchdogTimer = setInterval(() => {
+      this._runReverseWatchdogTick()
+    }, intervalMs)
+    if (this._reverseWatchdogTimer && typeof this._reverseWatchdogTimer.unref === 'function') {
+      this._reverseWatchdogTimer.unref()
+    }
+  }
+
+  stopReverseWatchdog() {
+    if (this._reverseWatchdogTimer) {
+      clearInterval(this._reverseWatchdogTimer)
+      this._reverseWatchdogTimer = null
+    }
+    this._reverseWatchdogRunning = false
+    this._reverseSerialQueue.clear()
+  }
+
+  _runReverseWatchdogTick() {
+    // 上一轮还在跑就跳过，避免并发叠加导致 adb 压力过大
+    if (this._reverseWatchdogRunning) return
+    this._reverseWatchdogRunning = true
+    ;(async () => {
+      // 这里用的是 currentDeviceMap，依赖 adb-commander 库
+      // 后续如果有问题，这里可以改成实时 adb devices 去查设备列表
+      const serials = Array.from(this.currentDeviceMap.keys())
+      if (serials.length === 0) return
+      // 多设备允许并发，但同一 sn 内部仍然会串行（见 _enqueueReverseTask）
+      const concurrency = Number(this.option.reverseWatchdogConcurrency || 3)
+      await this._mapWithConcurrency(serials, concurrency, (sn) => {
+        return this._enqueueReverseTask(sn, () => this._ensureReverseForDevice(sn))
+      })
+    })()
+      .catch((err) => {
+        debuglog(`reverse watchdog tick failed: ${err && err.message ? err.message : String(err)}`)
+      })
+      .finally(() => {
+        this._reverseWatchdogRunning = false
+      })
+  }
+
+  _enqueueReverseTask(sn, task) {
+    // 对同一个 sn 的任务按 promise 链串起来：保证同一设备上的 adb reverse --list / reverse 操作不会交错执行
+    const previous = this._reverseSerialQueue.get(sn) || Promise.resolve()
+    const next = previous
+      .catch(() => undefined)
+      .then(() => task())
+      .finally(() => {
+        if (this._reverseSerialQueue.get(sn) === next) {
+          this._reverseSerialQueue.delete(sn)
+        }
+      })
+    this._reverseSerialQueue.set(sn, next)
+    return next
+  }
+
+  async _mapWithConcurrency(items, concurrency, iterator) {
+    // 简单并发池：最多同时执行 limit 个 iterator
+    const limit = Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 1
+    const executing = new Set()
+    const results = []
+
+    for (const item of items) {
+      const p = Promise.resolve().then(() => iterator(item))
+      results.push(p)
+      executing.add(p)
+      const cleanup = () => executing.delete(p)
+      p.then(cleanup, cleanup)
+      if (executing.size >= limit) {
+        await Promise.race(executing)
+      }
+    }
+
+    return Promise.allSettled(results)
+  }
+
+  _reverseListMatchesExpected(reverseListOutput, localReversePort, remoteReversePort) {
+    // adb reverse --list 的典型输出每行类似：
+    // tcp:12345 tcp:12306
+    if (!reverseListOutput) return false
+    const expectedLocal = Number(localReversePort)
+    const expectedRemote = Number(remoteReversePort)
+    const lines = String(reverseListOutput)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+
+    for (const line of lines) {
+      const match = line.match(/^tcp:(\d+)\s+tcp:(\d+)$/)
+      if (!match) continue
+      const a = Number(match[1])
+      const b = Number(match[2])
+      if (
+        (a === expectedLocal && b === expectedRemote) ||
+        (a === expectedRemote && b === expectedLocal)
+      ) {
+        return true
+      }
+    }
+
+    const localStr = String(expectedLocal)
+    const remoteStr = String(expectedRemote)
+    return lines.some((line) => line.includes(localStr) && line.includes(remoteStr))
+  }
+
+  async _ensureReverseForDevice(sn, { log = false } = {}) {
+    const localReversePort = this.option.localReversePort
+    let reverseListOutput = ''
+
+    try {
+      // 使用 -s sn 做到按设备维度校验，支持多设备同时连接
+      const { result } = await this.commander._commandFactory(`adb -s ${sn} reverse --list`)
+      reverseListOutput = result || ''
+    } catch (err) {
+      reverseListOutput = ''
+    }
+
+    const ok = this._reverseListMatchesExpected(
+      reverseListOutput,
+      localReversePort,
+      REMOTE_REVERSE_PORT
+    )
+    if (ok) {
+      if (log) {
+        colorconsole.info(`### App Server ### (${sn}) adb reverse已就绪`)
+      }
+      return { ok: true }
+    }
+
+    // reverse 缺失：执行一次补建
+    const reverseResult = await this.establishADBProxyLink('reverse', [
+      sn,
+      localReversePort,
+      REMOTE_REVERSE_PORT
+    ])
+
+    if (reverseResult.err) {
+      if (log) {
+        colorconsole.error(
+          `### App Server ### (${sn}) 建立adb reverse失败(local port: ${localReversePort}, remote port: ${REMOTE_REVERSE_PORT})`
+        )
+      }
+      return { ok: false, err: reverseResult.err }
+    }
+
+    if (log) {
+      colorconsole.info(
+        `### App Server ### (${sn}) 已修复adb reverse(local port: ${localReversePort}, remote port: ${REMOTE_REVERSE_PORT})`
+      )
+    }
+
+    return { ok: true, repaired: true }
   }
   /**
    * 移除设备事件
@@ -236,6 +396,8 @@ class ADBModule {
     const { sn } = event
     colorconsole.info(`### App Server ### 手机设备(${sn})被拔出`)
     this.currentDeviceMap.delete(sn)
+    // 避免该设备后续队列中残留任务引用
+    this._reverseSerialQueue.delete(sn)
     if (this.DEBUG) {
       debuglog(
         `deviceRemoved():(${sn}) cachedDeviceList: ${JSON.stringify(
@@ -342,6 +504,8 @@ class ADBModule {
 
   _stop() {
     colorconsole.log(`### ADB stop`)
+    // 停止定时巡检，避免进程无法退出或持续刷 adb
+    this.stopReverseWatchdog()
     this.devicesEmitter.stop()
   }
 }
